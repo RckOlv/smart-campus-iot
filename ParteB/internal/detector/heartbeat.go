@@ -1,47 +1,153 @@
 package detector
 
-// TODO 5-8: Implementar envio y recepcion de heartbeats UDP.
-// Necesitaras importar:
-//   "encoding/json"
-//   "fmt"
-//   "net"
-//   "time"
-//   "sd-comunicacion/pkg/protocolo"
+import (
+	"encoding/json"
+	"fmt"
+	"net"
+	"strings"
+	"time"
 
-// Enviador se encarga de enviar heartbeats UDP periodicamente
+	"sd-comunicacion/pkg/protocolo"
+)
+
+// ==========================================
+// 1. EL ENVIADOR (Corre en el Servidor)
+// ==========================================
+
 type Enviador struct {
 	destino   string
-	intervalo time.Duration // TODO: usar time.Duration en vez de int64
+	intervalo time.Duration
 	nodoID    string
 	contador  int
 }
 
-// TODO 5: Implementar la funcion NuevaEnviador.
-// Debe recibir destino (string), intervalo (time.Duration) y nodoID (string).
-
-// TODO 6: Implementar el metodo (e *Enviador) Iniciar().
-// Debe enviar Heartbeat cada 'intervalo' por UDP al destino configurado.
-
-// Receptor escucha heartbeats y detecta si dejan de llegar.
-// Debe manejar estados: alive -> suspect -> dead.
-type Receptor struct {
-	puerto  string
-	timeout time.Duration // TODO: usar time.Duration en vez de int64
-	// ultimo debe guardar time.Time o timestamp del ultimo heartbeat recibido
-	ultimo time.Time
-	// estado puede ser "alive", "suspect" o "dead"
-	activo bool
+func NuevoEnviador(destino string, intervalo time.Duration, nodoID string) *Enviador {
+	return &Enviador{
+		destino:   destino,
+		intervalo: intervalo,
+		nodoID:    nodoID,
+		contador:  0,
+	}
 }
 
-// TODO 7: Implementar la funcion NuevoReceptor.
-// Debe recibir puerto (string) y timeout (time.Duration).
+func (e *Enviador) Iniciar() {
+	destinos := strings.Split(e.destino, ",")
+	ticker := time.NewTicker(e.intervalo)
+	defer ticker.Stop()
 
-// TODO 8: Implementar el metodo (r *Receptor) Escuchar().
-// Debe:
-//   - Escuchar UDP en 'puerto'
-//   - Decodificar mensajes JSON tipo protocolo.Heartbeat
-//   - Actualizar ultimo timestamp al recibir
-//   - En una goroutine separada, revisar periodicamente:
-//       si time.Since(ultimo) > timeout: pasar a "suspect"
-//       (opcional) si time.Since(ultimo) > 2*timeout: pasar a "dead"
-//   - Imprimir cambios de estado por consola
+	fmt.Printf("[HEARTBEAT-TX] Motor de latidos iniciado para destinos: %s\n", e.destino)
+
+	for range ticker.C {
+		e.contador++
+		latido := protocolo.Heartbeat{
+			NodoID:    e.nodoID,
+			Timestamp: time.Now().Unix(),
+			Contador:  e.contador,
+		}
+		data, _ := json.Marshal(latido)
+
+		for _, d := range destinos {
+			target := strings.TrimSpace(d)
+			addr, err := net.ResolveUDPAddr("udp", target)
+			if err != nil {
+				continue
+			}
+
+			conn, err := net.DialUDP("udp", nil, addr)
+			if err != nil {
+				continue
+			}
+			conn.Write(data)
+			conn.Close() 
+		}
+	}
+}
+
+// ==========================================
+// 2. EL RECEPTOR (Corre en el Cliente)
+// ==========================================
+
+type Receptor struct {
+	puerto  string
+	timeout time.Duration
+	ultimo  time.Time
+	estado  string
+}
+
+func NuevoReceptor(puerto string, timeout time.Duration) *Receptor {
+	return &Receptor{
+		puerto:  puerto,
+		timeout: timeout,
+		ultimo:  time.Now(),
+		estado:  "unknown",
+	}
+}
+
+func (r *Receptor) Escuchar() {
+	addr, err := net.ResolveUDPAddr("udp", r.puerto)
+	if err != nil {
+		fmt.Printf("[HEARTBEAT-RX] Error resolviendo puerto: %v\n", err)
+		return
+	}
+
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		fmt.Printf("[HEARTBEAT-RX] Error escuchando en UDP: %v\n", err)
+		return
+	}
+	defer conn.Close()
+
+	fmt.Printf("[HEARTBEAT-RX] Escuchando latidos en el puerto %s\n", r.puerto)
+
+	go func() {
+		reloj := time.NewTicker(1 * time.Second)
+		defer reloj.Stop()
+
+		for range reloj.C {
+			if r.estado == "unknown" {
+				continue
+			}
+
+			tiempoPasado := time.Since(r.ultimo)
+			nuevoEstado := r.estado
+
+			if tiempoPasado > 2*r.timeout {
+				nuevoEstado = "dead"
+			} else if tiempoPasado > r.timeout {
+				nuevoEstado = "suspect"
+			} else {
+				nuevoEstado = "alive"
+			}
+
+			if nuevoEstado != r.estado {
+				r.estado = nuevoEstado
+				switch r.estado {
+				case "dead":
+					fmt.Printf("[ALERTA] Servidor DEAD ☠️ (hace %v que no responde)\n", tiempoPasado.Round(time.Second))
+				case "suspect":
+					fmt.Printf("[ALERTA] Servidor SUSPECT ⚠️ (timeout superado)\n")
+				case "alive":
+					fmt.Printf("[INFO] Servidor recuperado a ALIVE 🟢\n")
+				}
+			}
+		}
+	}()
+
+	buffer := make([]byte, 1024)
+	for {
+		n, _, err := conn.ReadFromUDP(buffer)
+		if err != nil {
+			continue
+		}
+
+		var latido protocolo.Heartbeat
+		if err := json.Unmarshal(buffer[:n], &latido); err == nil {
+			r.ultimo = time.Now()
+			
+			if r.estado == "unknown" {
+				r.estado = "alive"
+				fmt.Printf("[INFO] Primer latido recibido de %s. Estado: ALIVE 🟢\n", latido.NodoID)
+			}
+		}
+	}
+}
